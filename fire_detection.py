@@ -3,10 +3,12 @@ import json
 import subprocess
 from ultralytics import YOLO
 from time import sleep
+import time
 import numpy as np
 import os
 import pigpio
 import threading
+import mysql.connector  # Menggunakan mysql-connector
 
 # ======================
 # 🔧 Setup (Servo, Relay, Buzzer)
@@ -79,6 +81,38 @@ CONF_THRESHOLD = 0.5
 RESULTS = []
 
 # ======================
+# 💾 Database Setup (MySQL)
+# ======================
+db_config = {
+    'host': '103.250.11.139',
+    'user': 'shieldweb_remote',
+    'password': 'P@ssw0rd',
+    'database': 'shieldweb'
+}
+
+def save_ai_result_to_db(json_data, image_path=None):
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor()
+        
+        # Simpan JSON sebagai string
+        json_str = json.dumps(json_data)
+        
+        cursor.execute(
+            "INSERT INTO ai_detections (json_data, image_path) VALUES (%s, %s)",
+            (json_str, image_path)
+        )
+        conn.commit()
+        print("✅ Hasil deteksi AI disimpan ke database MySQL.")
+        
+    except mysql.connector.Error as err:
+        print(f"❌ Gagal menyimpan ke MySQL: {err}")
+    finally:
+        if 'conn' in locals() and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# ======================
 # 📸 Capture Function
 # ======================
 def capture_image(filename):
@@ -147,7 +181,15 @@ for label, x_pos, y_pos, filename in captured_images:
 # ======================
 # 🎯 Tracking & Relay
 # ======================
+# Menyiapkan data untuk disimpan ke DB
+db_result_data = {
+    "scan_results": RESULTS,
+    "best_detection": best_detection,
+    "fire_detected": False 
+}
+
 if best_detection:
+    db_result_data["fire_detected"] = True
     print(f"\n🎯 Moving servo to {best_detection['label']} (best fire spot)")
     buzzer_background()  # 🔔 jalankan buzzer tanpa menunggu
     move_servo(best_detection["servo_x"], best_detection["servo_y"])
@@ -183,6 +225,10 @@ if best_detection:
         if not fire_box:
             print("⚠ Api hilang, berhenti tracking.")
             pi.write(RELAY_PIN, 0)
+            
+            # Simpan hasil akhir ke DB sebelum keluar
+            save_ai_result_to_db(db_result_data, "fire_centered.jpg" if os.path.exists("fire_centered.jpg") else None)
+            
             # 🔁 Jalankan kembali sensor suhu & gas
             print("♻️ Mengalihkan ke sensor_trigger.py...")
             subprocess.run(["python3", "sensor_trigger.py"])
@@ -196,6 +242,10 @@ if best_detection:
             save_path = os.path.join(os.getcwd(), "fire_centered.jpg")
             cv2.imwrite(save_path, frame)
             print(f"📸 Gambar tersimpan: {save_path}")
+            
+            # Simpan ke DB saat api ditemukan dan di tengah
+            save_ai_result_to_db(db_result_data, "fire_centered.jpg")
+            
             pi.write(RELAY_PIN, 1)
             sleep(5)
             pi.write(RELAY_PIN, 0)
@@ -212,9 +262,11 @@ if best_detection:
 
 else:
     print("\n❌ Tidak ada api terdeteksi di semua gambar.")
+    # Simpan hasil negatif ke DB
+    save_ai_result_to_db(db_result_data)
 
 # ======================
-# 💾 Save Result ke JSON
+# 💾 Save Result ke JSON (Lokal Backup)
 # ======================
 with open("fire_servo_results.json", "w") as f:
     json.dump(RESULTS, f, indent=4)

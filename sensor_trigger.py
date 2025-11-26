@@ -4,7 +4,7 @@ import adafruit_dht
 import board
 import RPi.GPIO as GPIO
 import json
-import sqlite3
+import mysql.connector
 import subprocess
 
 # ======================
@@ -45,39 +45,32 @@ def voltage_to_level(voltage):
     return round((voltage / 3.3) * 1000, 1)
 
 # ======================
-# 💾 Database Setup
+# 💾 Database Setup (Hanya Koneksi)
 # ======================
-DB_PATH = "monitoring.db"
-conn = sqlite3.connect(DB_PATH)
-cursor = conn.cursor()
+db_config = {
+    'host': '103.250.11.139',
+    'user': 'shieldweb_remote',
+    'password': 'P@ssw0rd',
+    'database': 'shieldweb'
+}
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS sensor_readings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    temperature REAL NOT NULL,
-    gas_level REAL NOT NULL
-)
-""")
+try:
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    print("✅ Terhubung ke database MySQL.")
+except mysql.connector.Error as err:
+    print(f"❌ Gagal terhubung ke MySQL: {err}")
+    exit()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS ai_detections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    json_data TEXT NOT NULL,
-    image_path TEXT
-)
-""")
-
-conn.commit()
+# (Bagian CREATE TABLE telah dihapus karena tabel sudah ada)
 
 # ======================
 # ⏱️ Timer untuk kontrol AI
 # ======================
-last_ai_run = 0               # waktu terakhir AI dijalankan (kritis)
-AI_COOLDOWN = 60              # cooldown minimal 1 menit
-last_periodic_run = time.time()  # waktu terakhir AI dijalankan otomatis
-PERIODIC_INTERVAL = 600       # setiap 10 menit (600 detik)
+last_ai_run = 0               
+AI_COOLDOWN = 60              
+last_periodic_run = time.time()
+PERIODIC_INTERVAL = 600       
 
 # ======================
 # 🔄 Loop Monitoring
@@ -93,7 +86,7 @@ try:
         # --- Baca DHT22 ---
         try:
             temperature = dht_sensor.temperature
-            humidity = dht_sensor.humidity
+            # humidity = dht_sensor.humidity
         except RuntimeError as e:
             print(f"⚠️ Gagal membaca DHT22: {e}")
             time.sleep(2)
@@ -105,22 +98,35 @@ try:
             continue
 
         # --- Simpan ke DB (tabel sensor_readings) ---
-        cursor.execute(
-            "INSERT INTO sensor_readings (temperature, gas_level) VALUES (?, ?)",
-            (temperature, gas_level)
-        )
-        conn.commit()
+        try:
+            # Cek koneksi sebelum insert, reconnect jika putus
+            if not conn.is_connected():
+                print("⚠️ Koneksi terputus, mencoba menghubungkan ulang...")
+                conn.reconnect(attempts=3, delay=2)
+            
+            cursor.execute(
+                "INSERT INTO sensor_readings (temperature, gas_level) VALUES (%s, %s)",
+                (temperature, gas_level)
+            )
+            conn.commit()
+            print(f"✅ Data Tersimpan: Temp={temperature:.1f}, Gas={gas_level:.1f}")
 
-        # --- Simpan ke JSON ---
+        except mysql.connector.Error as err:
+            print(f"❌ Gagal menyimpan ke database: {err}")
+
+        # --- Simpan ke JSON Lokal (Opsional/Backup) ---
         data = {
             "temperature": temperature,
             "gas_level": gas_level,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
-        with open("sensor_data.json", "w") as f:
-            json.dump(data, f, indent=4)
+        try:
+            with open("sensor_data.json", "w") as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"⚠️ Gagal tulis JSON: {e}")
 
-        # --- Log ke terminal ---
+        # --- Log Tampilan ---
         print(f"🔥 MQ-2: {gas_level:.1f} | 🌡 Suhu: {temperature:.1f}°C")
 
         now = time.time()
@@ -129,19 +135,25 @@ try:
         if gas_level > 50 or temperature > 35:
             if now - last_ai_run > AI_COOLDOWN:
                 print("🚨 Kondisi kritis! Menjalankan deteksi AI...")
-                subprocess.run(["python3", "fire_detection.py"])
-                last_ai_run = now
-                last_periodic_run = now  # reset timer periodik juga
+                try:
+                    subprocess.run(["python3", "fire_detection.py"])
+                    last_ai_run = now
+                    last_periodic_run = now  
+                except Exception as e:
+                    print(f"❌ Gagal menjalankan script AI: {e}")
             else:
                 remaining = int(AI_COOLDOWN - (now - last_ai_run))
-                print(f"⏳ AI sedang cooldown ({remaining}s lagi sebelum dijalankan ulang).")
+                print(f"⏳ AI sedang cooldown ({remaining}s lagi).")
 
         # --- Jalankan fire_detection.py setiap 10 menit ---
         elif now - last_periodic_run > PERIODIC_INTERVAL:
             print("🕒 Menjalankan deteksi AI otomatis (setiap 10 menit)...")
-            subprocess.run(["python3", "fire_detection.py"])
-            last_periodic_run = now
-            last_ai_run = now
+            try:
+                subprocess.run(["python3", "fire_detection.py"])
+                last_periodic_run = now
+                last_ai_run = now
+            except Exception as e:
+                print(f"❌ Gagal menjalankan script AI periodik: {e}")
 
         else:
             print("✅ Kondisi aman.")
@@ -153,6 +165,8 @@ except KeyboardInterrupt:
 
 finally:
     spi.close()
-    conn.close()
+    if 'conn' in locals() and conn.is_connected():
+        cursor.close()
+        conn.close()
     GPIO.cleanup()
     print("GPIO & SPI ditutup dengan aman.")
